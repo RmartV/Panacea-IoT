@@ -1,6 +1,6 @@
 {
   "name": "panacea-dashboard",
-  "homepage": "https://rmartv.github.io/panacea-iot/",
+  "homepage": "https://rmartv.github.io/panacea-IoT/",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
