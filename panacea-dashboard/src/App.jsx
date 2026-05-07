@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { createClient } from '@supabase/supabase-js';
-import { Settings, Activity, Thermometer, Droplets, Sun, Power, Database, Key, Cpu } from 'lucide-react';
+import { Settings, Database, Key } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { Chart } from 'chart.js/auto';
 
 export default function App() {
   // 1. Dynamic Configuration State (Persisted in Local Storage)
@@ -11,25 +12,23 @@ export default function App() {
   });
   const [isConfigOpen, setIsConfigOpen] = useState(false);
   
-  // 2. Sensor Data State (Matches your Supabase Columns)
-  const [data, setData] = useState({ 
-    node_name: 'Awaiting Data...', 
-    temperature: 0, 
-    humidity: 0, 
-    light_level: 0, 
-    led_status: false 
-  });
+  // 2. Multi-node Data State
+  const [nodes, setNodes] = useState({});
+  const [nodeHistory, setNodeHistory] = useState({});
+  const [activeChartTab, setActiveChartTab] = useState({});
   const [logs, setLogs] = useState([]);
-
+  const [isConnected, setIsConnected] = useState(false);
+  
   // Helper function to push logs to the UI
-  function addLog(msg) {
-    setLogs(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 6));
+  function addLog(type, nodeName, msg, val) {
+    const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    setLogs(prev => [{ ts, type, nodeName, msg, val }, ...prev].slice(0, 20));
   }
 
   // 3. Initialize Supabase Client whenever keys change
   const supabase = useMemo(() => {
     if (config.url && config.key) {
-      addLog(`System: Connecting to database...`);
+      addLog('SYS', 'SYSTEM', 'Connecting to database', '');
       return createClient(config.url, config.key);
     }
     return null;
@@ -39,32 +38,110 @@ export default function App() {
   useEffect(() => {
     if (!supabase) return;
 
-    // Fetch the absolute latest row first so you aren't waiting for the 10-second Arduino delay
     const fetchInitialData = async () => {
-      const { data: initialData, error } = await supabase
-        .from('sensor_data')
+      const { data: allData, error } = await supabase
+        .from('sensor_logs')
         .select('*')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
+        .order('created_at', { ascending: false });
       
-      if (initialData) {
-        setData(initialData);
-        addLog(`System: Fetched latest state for ${initialData.node_name}`);
+      if (error) {
+        addLog('ERROR', 'SYSTEM', 'Failed to fetch data', error.message);
+        return;
+      }
+      
+      if (allData && allData.length > 0) {
+        const uniqueNodes = {};
+        const newHistory = {};
+        
+        // Group by node_name and take the latest for each
+        allData.forEach(row => {
+          // Skip unknown_node
+          if (row.node_name === 'unknown_node') return;
+          
+          if (!uniqueNodes[row.node_name]) {
+            const timestamp = new Date(row.created_at).getTime();
+            uniqueNodes[row.node_name] = row;
+            newHistory[row.node_name] = {
+              temperature: row.temperature ? [{ x: timestamp, y: parseFloat(row.temperature) || 0 }] : [],
+              humidity: row.humidity ? [{ x: timestamp, y: parseFloat(row.humidity) || 0 }] : [],
+              light_level: row.light_level ? [{ x: timestamp, y: parseFloat(row.light_level) || 0 }] : []
+            };
+          }
+        });
+        
+        setNodes(uniqueNodes);
+        setNodeHistory(newHistory);
+        
+        // Initialize active chart tabs
+        const tabs = {};
+        Object.keys(uniqueNodes).forEach(nodeName => {
+          tabs[nodeName] = 'temperature';
+        });
+        setActiveChartTab(tabs);
+        
+        addLog('SYS', 'SYSTEM', `Loaded ${Object.keys(uniqueNodes).length} unique node(s)`, '');
+      } else {
+        addLog('SYS', 'SYSTEM', 'No data found in sensor_logs table', '');
       }
     };
     
     fetchInitialData();
 
-    // Subscribe to new rows being inserted by n8n
+    // Subscribe to new rows being inserted
     const subscription = supabase
       .channel('sensor-updates')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sensor_data' }, (payload) => {
-        setData(payload.new);
-        addLog(`Data: Received telemetry from ${payload.new.node_name} (Temp: ${payload.new.temperature}°C)`);
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sensor_logs' }, (payload) => {
+        const newData = payload.new;
+        
+        // IGNORE "unknown_node" to keep the dashboard clean
+        if (newData.node_name === 'unknown_node') return;
+
+        setNodes(prev => ({
+          ...prev,
+          [newData.node_name]: { ...newData, lastUpdate: new Date().getTime() }
+        }));
+
+        // Initialize or update history
+        setNodeHistory(prev => {
+          const nodeHist = prev[newData.node_name] || {
+            temperature: [],
+            humidity: [],
+            light_level: []
+          };
+          
+          const now = new Date(newData.created_at).getTime();
+          nodeHist.temperature.push({ x: now, y: parseFloat(newData.temperature) || 0 });
+          nodeHist.humidity.push({ x: now, y: parseFloat(newData.humidity) || 0 });
+          nodeHist.light_level.push({ x: now, y: parseFloat(newData.light_level) || 0 });
+          
+          // Keep only last 40 points
+          ['temperature', 'humidity', 'light_level'].forEach(metric => {
+            if (nodeHist[metric].length > 40) {
+              nodeHist[metric] = nodeHist[metric].slice(-40);
+            }
+          });
+          
+          return {
+            ...prev,
+            [newData.node_name]: nodeHist
+          };
+        });
+
+        // Initialize chart tab if needed
+        setActiveChartTab(prev => {
+          if (!prev[newData.node_name]) {
+            return { ...prev, [newData.node_name]: 'temperature' };
+          }
+          return prev;
+        });
+
+        addLog('DATA', newData.node_name, `→ temp ${newData.temperature}°C · RH ${newData.humidity}% · lux ${newData.light_level}`, '');
       })
       .subscribe((status) => {
-        if (status === 'SUBSCRIBED') addLog(`Status: Real-time telemetry connection ACTIVE.`);
+        if (status === 'SUBSCRIBED') {
+          setIsConnected(true);
+          addLog('SYS', 'SYSTEM', 'Real-time telemetry connection ACTIVE', '');
+        }
       });
 
     return () => { supabase.removeChannel(subscription); };
@@ -76,117 +153,123 @@ export default function App() {
     localStorage.setItem('sb_url', config.url);
     localStorage.setItem('sb_key', config.key);
     setIsConfigOpen(false);
-    addLog("Config: New Supabase credentials applied.");
+    addLog("CFG", "SYSTEM", "credentials updated", config.url.split('/').pop() || 'local');
   };
 
+  const onlineNodes = Object.values(nodes).filter(n => n.online).length;
+  const totalNodes = Object.keys(nodes).length;
+
   return (
-    <div className="min-h-screen bg-[#F8FAFC] text-slate-900 p-6 md:p-12 font-sans">
-      <div className="max-w-5xl mx-auto">
+    <div className="min-h-screen bg-slate-900 text-slate-100 p-6 md:p-8">
+      <div className="max-w-full mx-auto">
         
         {/* Header */}
-        <header className="flex justify-between items-center mb-10 border-b border-slate-200 pb-6">
+        <div className="flex justify-between items-end mb-6 pb-4 border-b border-slate-700">
           <div>
-            <h1 className="text-3xl font-bold tracking-tight text-slate-800 mb-1">Panacea Edge Dashboard</h1>
-            <p className="text-slate-500 text-sm flex items-center gap-2">
-              <Cpu size={14} className="text-blue-500" /> Active Node: <span className="font-semibold text-slate-700">{data.node_name}</span>
-            </p>
+            <h1 className="text-2xl font-bold tracking-tight mb-1">Panacea Edge</h1>
+            <div className="flex items-center gap-3">
+              <p className="text-sm text-slate-400 font-mono">LIVE · {onlineNodes}/{totalNodes} NODES · LAST SYNC 0s AGO</p>
+              <span className={`flex items-center gap-1 text-xs px-2 py-1 rounded-full font-mono ${
+                isConnected 
+                  ? 'bg-emerald-900/30 text-emerald-300' 
+                  : 'bg-slate-700 text-slate-400'
+              }`}>
+                <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}></span>
+                {isConnected ? 'CONNECTED' : 'DISCONNECTED'}
+              </span>
+            </div>
           </div>
           <button 
             onClick={() => setIsConfigOpen(!isConfigOpen)}
-            className={`p-3 rounded-full transition-all ${isConfigOpen ? 'bg-slate-800 text-white shadow-md' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 shadow-sm'}`}
+            className="flex items-center gap-2 px-3 py-2 text-sm border border-slate-600 rounded-md hover:bg-slate-800 transition-colors"
           >
-            <Settings size={22} />
+            <Settings size={16} />
+            Configure
           </button>
-        </header>
+        </div>
 
         {/* Dynamic Config Drawer */}
         <AnimatePresence>
           {isConfigOpen && (
             <motion.div 
-              initial={{ height: 0, opacity: 0, y: -10 }}
-              animate={{ height: 'auto', opacity: 1, y: 0 }}
-              exit={{ height: 0, opacity: 0, y: -10 }}
-              className="overflow-hidden bg-white border border-slate-200 rounded-2xl mb-8 shadow-sm"
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden grid grid-cols-1 md:grid-cols-2 gap-3 p-4 mb-6 bg-slate-800 border border-slate-700 rounded-lg"
             >
-              <form onSubmit={saveConfig} className="p-6 grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <label className="text-xs font-semibold uppercase text-slate-400 flex items-center gap-2">
-                    <Database size={12} /> Supabase Project URL
-                  </label>
-                  <input 
-                    className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 ring-blue-500/20 focus:border-blue-500 transition-all"
-                    value={config.url}
-                    onChange={(e) => setConfig({...config, url: e.target.value})}
-                    placeholder="https://xyz.supabase.co"
-                    required
-                  />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-xs font-semibold uppercase text-slate-400 flex items-center gap-2">
-                    <Key size={12} /> Supabase Anon Key
-                  </label>
-                  <input 
-                    type="password"
-                    className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 ring-blue-500/20 focus:border-blue-500 transition-all"
-                    value={config.key}
-                    onChange={(e) => setConfig({...config, key: e.target.value})}
-                    placeholder="eyJhbG..."
-                    required
-                  />
-                </div>
-                <button type="submit" className="md:col-span-2 bg-slate-900 text-white text-sm py-3 font-medium rounded-lg hover:bg-slate-800 transition-colors shadow-sm">
-                  Initialize Connection
-                </button>
-              </form>
+              <div>
+                <label className="block text-xs font-semibold uppercase text-slate-400 mb-2">Supabase URL</label>
+                <input 
+                  className="w-full bg-slate-700 border border-slate-600 rounded px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-slate-400"
+                  value={config.url}
+                  onChange={(e) => setConfig({...config, url: e.target.value})}
+                  placeholder="https://xyz.supabase.co"
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-xs font-semibold uppercase text-slate-400 mb-2 block">Anon Key</label>
+                <input 
+                  type="password"
+                  className="w-full bg-slate-700 border border-slate-600 rounded px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-slate-400"
+                  value={config.key}
+                  onChange={(e) => setConfig({...config, key: e.target.value})}
+                  placeholder="eyJhbG..."
+                  required
+                />
+              </div>
+              <button 
+                onClick={saveConfig}
+                className="md:col-span-2 bg-slate-600 hover:bg-slate-500 text-white text-sm py-2 font-medium rounded transition-colors"
+              >
+                Initialize connection →
+              </button>
             </motion.div>
           )}
         </AnimatePresence>
 
-        {/* Stats Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-          <StatCard icon={<Thermometer />} label="Temperature" value={`${data.temperature}°C`} color="text-orange-500" bg="bg-orange-50" />
-          <StatCard icon={<Droplets />} label="Humidity" value={`${data.humidity}%`} color="text-blue-500" bg="bg-blue-50" />
-          <StatCard icon={<Sun />} label="Light Level" value={data.light_level} color="text-yellow-500" bg="bg-yellow-50" />
+        {/* Nodes Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
+          {Object.entries(nodes).length > 0 ? (
+            Object.entries(nodes).map(([nodeName, data]) => (
+              <NodeCard 
+                key={nodeName}
+                nodeName={nodeName}
+                data={data}
+                history={nodeHistory[nodeName] || { temperature: [], humidity: [], light_level: [] }}
+                activeTab={activeChartTab[nodeName] || 'temperature'}
+                onTabChange={(tab) => setActiveChartTab(prev => ({ ...prev, [nodeName]: tab }))}
+              />
+            ))
+          ) : (
+            <div className="col-span-full py-16 text-center text-slate-400">
+              <p className="text-sm mb-2">
+                {isConnected ? '✓ Connected to database · Awaiting sensor data...' : 'Configure Supabase to start receiving data'}
+              </p>
+              <p className="text-xs text-slate-500">Nodes will appear here when data is received from IoT devices</p>
+            </div>
+          )}
         </div>
 
-        {/* Console / Control Section */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          
-          {/* Logs Terminal */}
-          <div className="lg:col-span-2 bg-[#0F172A] rounded-2xl p-6 shadow-xl border border-slate-800 flex flex-col h-64">
-            <h3 className="text-slate-400 text-xs font-bold uppercase tracking-widest mb-4 flex items-center gap-2">
-              <span className="relative flex h-2 w-2">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-              </span>
-              Live System Logs
-            </h3>
-            <div className="space-y-2 font-mono text-xs overflow-y-auto flex-1">
-              {logs.length > 0 ? logs.map((log, i) => (
-                <div key={i} className="text-slate-300 border-l-2 border-slate-700 pl-3 py-1 bg-slate-800/30 rounded-r-sm">{log}</div>
-              )) : <div className="text-slate-500 italic">Awaiting API configuration... Click the settings icon above.</div>}
-            </div>
+        {/* System Log */}
+        <div className="bg-slate-800 border border-slate-700 rounded-lg overflow-hidden">
+          <div className="flex items-center justify-between p-4 border-b border-slate-700">
+            <span className="text-xs font-semibold uppercase text-slate-400">System log</span>
+            <span className="text-xs bg-slate-700 rounded-full px-2 py-1 text-slate-300">{logs.length} events</span>
           </div>
-
-          {/* Actuator Panel */}
-          <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col justify-between h-64">
-            <div>
-              <div className="flex justify-between items-start mb-1">
-                <h3 className="font-bold text-slate-800 text-lg">Physical Actuator</h3>
-                <div className={`p-2 rounded-md ${data.led_status ? 'bg-yellow-100 text-yellow-600' : 'bg-slate-100 text-slate-400'}`}>
-                  <Power size={18} />
-                </div>
+          <div className="max-h-64 overflow-y-auto">
+            {logs.length > 0 ? logs.map((log, i) => (
+              <div key={i} className="px-4 py-2 text-xs font-mono text-slate-300 border-b border-slate-700/50 hover:bg-slate-700/50 last:border-b-0">
+                <span className="text-slate-500">{log.ts}</span>
+                {' '}
+                <span className="text-slate-100 font-semibold">{log.nodeName}</span>
+                {' '}
+                <span className="text-slate-400">{log.msg}</span>
+                {log.val && <span className="text-emerald-400"> {log.val}</span>}
               </div>
-              <p className="text-slate-400 text-xs mb-6 leading-relaxed">Sends override command via webhook to n8n, targeting edge device.</p>
-            </div>
-            
-            <button className={`w-full p-4 rounded-xl flex items-center justify-center gap-2 transition-all font-semibold shadow-sm border ${
-              data.led_status 
-              ? 'bg-slate-50 hover:bg-slate-100 border-slate-200 text-slate-700' 
-              : 'bg-slate-900 hover:bg-slate-800 border-slate-900 text-white'
-            }`}>
-              {data.led_status ? 'Turn Off LED' : 'Turn On LED'}
-            </button>
+            )) : (
+              <div className="px-4 py-3 text-xs text-slate-500">Awaiting API configuration…</div>
+            )}
           </div>
         </div>
       </div>
@@ -194,16 +277,146 @@ export default function App() {
   );
 }
 
-// Reusable UI Component for the Cards
-function StatCard({ icon, label, value, color, bg }) {
+// Node Card Component
+function NodeCard({ nodeName, data, history, activeTab, onTabChange }) {
+  const chartRef = React.useRef({});
+
+  React.useEffect(() => {
+    // Build/update chart when data or active tab changes
+    if (!history[activeTab] || history[activeTab].length === 0) return;
+
+    const canvasId = `chart-${nodeName.replace(/\s/g, '-')}`;
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+
+    const metrics = {
+      temperature: { label: 'Temp', unit: '°C', color: '#D85A30', fill: 'rgba(216,90,48,0.1)' },
+      humidity: { label: 'RH', unit: '%', color: '#1D9E75', fill: 'rgba(29,158,117,0.1)' },
+      light_level: { label: 'Lux', unit: '', color: '#BA7517', fill: 'rgba(186,117,23,0.1)' }
+    };
+
+    const cfg = metrics[activeTab];
+    
+    if (chartRef.current[nodeName]) {
+      chartRef.current[nodeName].destroy();
+    }
+
+    const ctx = canvas.getContext('2d');
+    chartRef.current[nodeName] = new Chart(ctx, {
+      type: 'line',
+      data: {
+        datasets: [{
+          data: history[activeTab],
+          borderColor: cfg.color,
+          backgroundColor: cfg.fill,
+          borderWidth: 1.5,
+          pointRadius: 0,
+          fill: true,
+          tension: 0.4
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            mode: 'nearest',
+            intersect: false,
+            backgroundColor: 'rgba(0,0,0,0.75)',
+            padding: 6,
+            cornerRadius: 4,
+            titleFont: { size: 10 },
+            bodyFont: { size: 11, family: 'IBM Plex Mono' },
+            callbacks: { label: c => c.parsed.y.toFixed(1) + cfg.unit }
+          }
+        },
+        scales: {
+          x: { type: 'linear', display: false },
+          y: {
+            display: true,
+            position: 'right',
+            grid: { color: 'rgba(128,128,128,0.1)', lineWidth: 0.5 },
+            border: { display: false },
+            ticks: {
+              font: { size: 9 },
+              color: 'rgba(128,128,128,0.6)',
+              maxTicksLimit: 3,
+              callback: v => v.toFixed(0) + cfg.unit
+            }
+          }
+        }
+      }
+    });
+  }, [history, activeTab, nodeName]);
+
+  const isOnline = data.online !== false; // Default to true if not specified
+  const powerStatus = data.power_status || 'OFF';
+  const ledStatus = data.led_status ? 'ON' : 'OFF';
+  const statusDot = isOnline ? 'bg-emerald-500' : 'bg-red-500';
+
   return (
-    <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm flex items-center gap-5 hover:border-slate-300 transition-colors">
-      <div className={`${bg} ${color} p-4 rounded-xl`}>
-        {React.cloneElement(icon, { size: 28, strokeWidth: 2 })}
+    <div className="border border-slate-700 rounded-lg overflow-hidden bg-slate-800">
+      {/* Header */}
+      <div className="flex items-center justify-between p-3 border-b border-slate-700">
+        <span className="font-mono text-sm font-semibold text-slate-100">{nodeName}</span>
+        <div className="flex items-center gap-2">
+          <span className={`text-xs px-2 py-1 rounded-full font-mono ${
+            powerStatus === 'ON' ? 'bg-emerald-900/30 text-emerald-300' : 'bg-slate-700 text-slate-400'
+          }`}>
+            {powerStatus === 'ON' ? '● PWR ON' : '○ PWR OFF'}
+          </span>
+          <span className={`text-xs px-2 py-1 rounded-full font-mono ${
+            ledStatus === 'ON' ? 'bg-yellow-900/30 text-yellow-300' : 'bg-slate-700 text-slate-400'
+          }`}>
+            {ledStatus === 'ON' ? '💡 LED ON' : '💡 LED OFF'}
+          </span>
+          <div className={`w-2 h-2 rounded-full ${statusDot} ${isOnline ? 'animate-pulse' : ''}`}></div>
+        </div>
       </div>
-      <div>
-        <div className="text-3xl font-bold text-slate-800 tracking-tight">{value}</div>
-        <div className="text-slate-400 text-xs font-semibold uppercase mt-1 tracking-wider">{label}</div>
+
+      {/* Metrics */}
+      <div className="grid grid-cols-3 gap-2 p-3 border-b border-slate-700 text-center">
+        <div>
+          <div className="font-mono text-lg font-semibold text-slate-100">{data.temperature?.toFixed(1) || '—'}</div>
+          <div className="text-xs text-slate-500 uppercase">Temp <span className="text-slate-600">°C</span></div>
+        </div>
+        <div>
+          <div className="font-mono text-lg font-semibold text-slate-100">{data.humidity?.toFixed(0) || '—'}</div>
+          <div className="text-xs text-slate-500 uppercase">Humidity <span className="text-slate-600">%</span></div>
+        </div>
+        <div>
+          <div className="font-mono text-lg font-semibold text-slate-100">{data.light_level || '—'}</div>
+          <div className="text-xs text-slate-500 uppercase">Light <span className="text-slate-600">lux</span></div>
+        </div>
+      </div>
+
+      {/* Chart */}
+      <div className="p-3">
+        <div className="flex gap-2 mb-2 border-b border-slate-700 pb-2">
+          {['temperature', 'humidity', 'light_level'].map(tab => (
+            <button
+              key={tab}
+              onClick={() => onTabChange(tab)}
+              className={`text-xs px-2 py-1 uppercase font-medium transition-colors ${
+                activeTab === tab
+                  ? 'text-slate-100 border-b border-slate-100'
+                  : 'text-slate-500 hover:text-slate-300'
+              }`}
+            >
+              {tab === 'temperature' ? 'Temp' : tab === 'humidity' ? 'RH' : 'Light'}
+            </button>
+          ))}
+        </div>
+        <div className="h-20 relative">
+          <canvas 
+            id={`chart-${nodeName.replace(/\s/g, '-')}`}
+            role="img"
+            aria-label={`Sensor history for ${nodeName}`}
+            className="w-full"
+          ></canvas>
+        </div>
       </div>
     </div>
   );
