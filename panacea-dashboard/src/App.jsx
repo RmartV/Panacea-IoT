@@ -1,16 +1,74 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { createClient } from '@supabase/supabase-js';
-import { Settings, Database, Key } from 'lucide-react';
+import { Settings, Database, Key, TrendingUp, AlertTriangle, History } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Chart } from 'chart.js/auto';
+import Analytics from './components/Analytics';
+import PreviousRecords from './components/PreviousRecords';
+import { initializeAI } from './services/aiAnalytics';
 
-export default function App() {
+// Error Boundary Component
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error('Render Error:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-slate-900 text-slate-100 p-6 md:p-8 flex items-center justify-center">
+          <div className="max-w-md w-full bg-slate-800 border border-red-700/50 rounded-lg p-6">
+            <div className="flex items-start gap-3 mb-4">
+              <AlertTriangle className="text-red-500 flex-shrink-0 mt-1" size={24} />
+              <div>
+                <h2 className="text-lg font-bold text-red-300 mb-2">Application Error</h2>
+                <p className="text-sm text-slate-300 mb-3">
+                  The application encountered an error and couldn't render properly.
+                </p>
+                <p className="text-xs font-mono text-red-400 bg-slate-900 p-2 rounded mb-4 overflow-auto max-h-32">
+                  {this.state.error?.message}
+                </p>
+                <button 
+                  onClick={() => {
+                    this.setState({ hasError: false, error: null });
+                    window.location.reload();
+                  }}
+                  className="w-full bg-slate-600 hover:bg-slate-500 text-white text-sm py-2 rounded font-medium transition-colors"
+                >
+                  Reload Application
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
+function App() {
   // 1. Dynamic Configuration State (Persisted in Local Storage)
   const [config, setConfig] = useState({
     url: localStorage.getItem('sb_url') || '',
     key: localStorage.getItem('sb_key') || '',
+    geminiKey: localStorage.getItem('gemini_key') || '',
+    weatherApiKey: localStorage.getItem('weather_api_key') || '',
+    ollamaEndpoint: localStorage.getItem('ollama_endpoint') || '',
   });
   const [isConfigOpen, setIsConfigOpen] = useState(false);
+  const [isRecordsOpen, setIsRecordsOpen] = useState(false);
+  const [error, setError] = useState(null);
   
   // 2. Multi-node Data State
   const [nodes, setNodes] = useState({});
@@ -18,6 +76,8 @@ export default function App() {
   const [activeChartTab, setActiveChartTab] = useState({});
   const [logs, setLogs] = useState([]);
   const [isConnected, setIsConnected] = useState(false);
+  const [allHistoricalData, setAllHistoricalData] = useState(null);
+  const [isLoadingAllData, setIsLoadingAllData] = useState(false);
   
   // Helper function to push logs to the UI
   function addLog(type, nodeName, msg, val) {
@@ -25,122 +85,180 @@ export default function App() {
     setLogs(prev => [{ ts, type, nodeName, msg, val }, ...prev].slice(0, 20));
   }
 
+  // Fetch all historical data for analytics
+  const fetchAllHistoricalData = async (supabaseClient) => {
+    if (!supabaseClient) return;
+    
+    setIsLoadingAllData(true);
+    try {
+      const { data: allData, error } = await supabaseClient
+        .from('sensor_logs')
+        .select('*')
+        .order('created_at', { ascending: true });
+      
+      if (error) {
+        addLog('ERROR', 'SYSTEM', 'Failed to fetch all data', error.message);
+        return;
+      }
+      
+      if (allData && allData.length > 0) {
+        setAllHistoricalData(allData);
+        addLog('SYS', 'SYSTEM', `Loaded ${allData.length} total records`, '');
+      }
+    } catch (err) {
+      addLog('ERROR', 'SYSTEM', 'Error fetching historical data', err.message);
+    } finally {
+      setIsLoadingAllData(false);
+    }
+  };
+
   // 3. Initialize Supabase Client whenever keys change
   const supabase = useMemo(() => {
     if (config.url && config.key) {
-      addLog('SYS', 'SYSTEM', 'Connecting to database', '');
-      return createClient(config.url, config.key);
+      try {
+        addLog('SYS', 'SYSTEM', 'Connecting to database', '');
+        setError(null);
+        return createClient(config.url, config.key);
+      } catch (err) {
+        const errorMsg = `Database connection error: ${err.message}`;
+        setError(errorMsg);
+        addLog('ERROR', 'SYSTEM', 'Database connection failed', err.message);
+        return null;
+      }
     }
     return null;
-  }, [config]);
+  }, [config.url, config.key]);
 
   // 4. Listen for Real-Time Updates from Supabase
   useEffect(() => {
     if (!supabase) return;
 
+    // Initialize AI if key is available
+    if (config.geminiKey) {
+      initializeAI(config.geminiKey);
+    }
+
     const fetchInitialData = async () => {
-      const { data: allData, error } = await supabase
-        .from('sensor_logs')
-        .select('*')
-        .order('created_at', { ascending: false });
-      
-      if (error) {
-        addLog('ERROR', 'SYSTEM', 'Failed to fetch data', error.message);
-        return;
-      }
-      
-      if (allData && allData.length > 0) {
-        const uniqueNodes = {};
-        const newHistory = {};
+      try {
+        const { data: allData, error } = await supabase
+          .from('sensor_logs')
+          .select('*')
+          .order('created_at', { ascending: false });
         
-        // Group by node_name and take the latest for each
-        allData.forEach(row => {
-          // Skip unknown_node
-          if (row.node_name === 'unknown_node') return;
+        if (error) {
+          setError(`Failed to fetch data: ${error.message}`);
+          addLog('ERROR', 'SYSTEM', 'Failed to fetch data', error.message);
+          return;
+        }
+        
+        if (allData && allData.length > 0) {
+          const uniqueNodes = {};
+          const newHistory = {};
           
-          if (!uniqueNodes[row.node_name]) {
-            const timestamp = new Date(row.created_at).getTime();
-            uniqueNodes[row.node_name] = row;
-            newHistory[row.node_name] = {
-              temperature: row.temperature ? [{ x: timestamp, y: parseFloat(row.temperature) || 0 }] : [],
-              humidity: row.humidity ? [{ x: timestamp, y: parseFloat(row.humidity) || 0 }] : [],
-              light_level: row.light_level ? [{ x: timestamp, y: parseFloat(row.light_level) || 0 }] : []
-            };
-          }
-        });
-        
-        setNodes(uniqueNodes);
-        setNodeHistory(newHistory);
-        
-        // Initialize active chart tabs
-        const tabs = {};
-        Object.keys(uniqueNodes).forEach(nodeName => {
-          tabs[nodeName] = 'temperature';
-        });
-        setActiveChartTab(tabs);
-        
-        addLog('SYS', 'SYSTEM', `Loaded ${Object.keys(uniqueNodes).length} unique node(s)`, '');
-      } else {
-        addLog('SYS', 'SYSTEM', 'No data found in sensor_logs table', '');
+          // Group by node_name and take the latest for each
+          allData.forEach(row => {
+            // Skip unknown_node
+            if (row.node_name === 'unknown_node') return;
+            
+            if (!uniqueNodes[row.node_name]) {
+              const timestamp = new Date(row.created_at).getTime();
+              uniqueNodes[row.node_name] = row;
+              newHistory[row.node_name] = {
+                temperature: row.temperature ? [{ x: timestamp, y: parseFloat(row.temperature) || 0 }] : [],
+                humidity: row.humidity ? [{ x: timestamp, y: parseFloat(row.humidity) || 0 }] : [],
+                light_level: row.light_level ? [{ x: timestamp, y: parseFloat(row.light_level) || 0 }] : []
+              };
+            }
+          });
+          
+          setNodes(uniqueNodes);
+          setNodeHistory(newHistory);
+          
+          // Initialize active chart tabs
+          const tabs = {};
+          Object.keys(uniqueNodes).forEach(nodeName => {
+            tabs[nodeName] = 'temperature';
+          });
+          setActiveChartTab(tabs);
+          
+          addLog('SYS', 'SYSTEM', `Loaded ${Object.keys(uniqueNodes).length} unique node(s)`, '');
+        } else {
+          addLog('SYS', 'SYSTEM', 'No data found in sensor_logs table', '');
+        }
+      } catch (err) {
+        setError(`Error fetching initial data: ${err.message}`);
+        addLog('ERROR', 'SYSTEM', 'Error fetching data', err.message);
       }
     };
     
     fetchInitialData();
+    
+    // Fetch ALL historical data for analytics
+    fetchAllHistoricalData(supabase);
 
     // Subscribe to new rows being inserted
     const subscription = supabase
       .channel('sensor-updates')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sensor_logs' }, (payload) => {
-        const newData = payload.new;
-        
-        // IGNORE "unknown_node" to keep the dashboard clean
-        if (newData.node_name === 'unknown_node') return;
+        try {
+          const newData = payload.new;
+          
+          // IGNORE "unknown_node" to keep the dashboard clean
+          if (newData.node_name === 'unknown_node') return;
 
-        setNodes(prev => ({
-          ...prev,
-          [newData.node_name]: { ...newData, lastUpdate: new Date().getTime() }
-        }));
-
-        // Initialize or update history
-        setNodeHistory(prev => {
-          const nodeHist = prev[newData.node_name] || {
-            temperature: [],
-            humidity: [],
-            light_level: []
-          };
-          
-          const now = new Date(newData.created_at).getTime();
-          nodeHist.temperature.push({ x: now, y: parseFloat(newData.temperature) || 0 });
-          nodeHist.humidity.push({ x: now, y: parseFloat(newData.humidity) || 0 });
-          nodeHist.light_level.push({ x: now, y: parseFloat(newData.light_level) || 0 });
-          
-          // Keep only last 40 points
-          ['temperature', 'humidity', 'light_level'].forEach(metric => {
-            if (nodeHist[metric].length > 40) {
-              nodeHist[metric] = nodeHist[metric].slice(-40);
-            }
-          });
-          
-          return {
+          setNodes(prev => ({
             ...prev,
-            [newData.node_name]: nodeHist
-          };
-        });
+            [newData.node_name]: { ...newData, lastUpdate: new Date().getTime() }
+          }));
 
-        // Initialize chart tab if needed
-        setActiveChartTab(prev => {
-          if (!prev[newData.node_name]) {
-            return { ...prev, [newData.node_name]: 'temperature' };
-          }
-          return prev;
-        });
+          // Initialize or update history
+          setNodeHistory(prev => {
+            const nodeHist = prev[newData.node_name] || {
+              temperature: [],
+              humidity: [],
+              light_level: []
+            };
+            
+            const now = new Date(newData.created_at).getTime();
+            nodeHist.temperature.push({ x: now, y: parseFloat(newData.temperature) || 0 });
+            nodeHist.humidity.push({ x: now, y: parseFloat(newData.humidity) || 0 });
+            nodeHist.light_level.push({ x: now, y: parseFloat(newData.light_level) || 0 });
+            
+            // Keep only last 40 points
+            ['temperature', 'humidity', 'light_level'].forEach(metric => {
+              if (nodeHist[metric].length > 40) {
+                nodeHist[metric] = nodeHist[metric].slice(-40);
+              }
+            });
+            
+            return {
+              ...prev,
+              [newData.node_name]: nodeHist
+            };
+          });
 
-        addLog('DATA', newData.node_name, `→ temp ${newData.temperature}°C · RH ${newData.humidity}% · lux ${newData.light_level}`, '');
+          // Initialize chart tab if needed
+          setActiveChartTab(prev => {
+            if (!prev[newData.node_name]) {
+              return { ...prev, [newData.node_name]: 'temperature' };
+            }
+            return prev;
+          });
+
+          addLog('DATA', newData.node_name, `→ temp ${newData.temperature}°C · RH ${newData.humidity}% · lux ${newData.light_level}`, '');
+        } catch (err) {
+          addLog('ERROR', 'SYSTEM', 'Error processing data update', err.message);
+        }
       })
       .subscribe((status) => {
         if (status === 'SUBSCRIBED') {
           setIsConnected(true);
+          setError(null);
           addLog('SYS', 'SYSTEM', 'Real-time telemetry connection ACTIVE', '');
+        } else if (status === 'CHANNEL_ERROR') {
+          const errMsg = 'Real-time connection failed - check credentials';
+          setError(errMsg);
+          addLog('ERROR', 'SYSTEM', errMsg, '');
         }
       });
 
@@ -150,10 +268,22 @@ export default function App() {
   // Save Keys to Browser Storage
   const saveConfig = (e) => {
     e.preventDefault();
-    localStorage.setItem('sb_url', config.url);
-    localStorage.setItem('sb_key', config.key);
-    setIsConfigOpen(false);
-    addLog("CFG", "SYSTEM", "credentials updated", config.url.split('/').pop() || 'local');
+    try {
+      localStorage.setItem('sb_url', config.url);
+      localStorage.setItem('sb_key', config.key);
+      localStorage.setItem('gemini_key', config.geminiKey);
+      localStorage.setItem('weather_api_key', config.weatherApiKey);
+      localStorage.setItem('ollama_endpoint', config.ollamaEndpoint);
+      setError(null);
+      setIsConfigOpen(false);
+      if (config.geminiKey || config.ollamaEndpoint) {
+        initializeAI(config.geminiKey, config.ollamaEndpoint);
+      }
+      addLog("CFG", "SYSTEM", "credentials updated", config.url.split('/').pop() || 'local');
+    } catch (err) {
+      setError(`Failed to save configuration: ${err.message}`);
+      addLog('ERROR', 'SYSTEM', 'Failed to save config', err.message);
+    }
   };
 
   const onlineNodes = Object.values(nodes).filter(n => n.online).length;
@@ -186,7 +316,36 @@ export default function App() {
             <Settings size={16} />
             Configure
           </button>
+          <button 
+            onClick={() => setIsRecordsOpen(true)}
+            className="flex items-center gap-2 px-3 py-2 text-sm border border-slate-600 rounded-md hover:bg-slate-800 transition-colors"
+            title="View previous sensor records"
+          >
+            <History size={16} />
+            Records
+          </button>
         </div>
+
+        {/* Error Display */}
+        {error && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="mb-6 p-4 bg-red-900/20 border border-red-700/50 rounded-lg flex items-start gap-3"
+          >
+            <div className="w-4 h-4 rounded-full bg-red-500 flex-shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <p className="text-sm text-red-300 font-mono">{error}</p>
+              <button 
+                onClick={() => setError(null)}
+                className="text-xs text-red-400 hover:text-red-300 mt-2 underline"
+              >
+                Dismiss
+              </button>
+            </div>
+          </motion.div>
+        )}
 
         {/* Dynamic Config Drawer */}
         <AnimatePresence>
@@ -208,7 +367,7 @@ export default function App() {
                 />
               </div>
               <div>
-                <label className="text-xs font-semibold uppercase text-slate-400 mb-2 block">Anon Key</label>
+                <label className="text-xs font-semibold uppercase text-slate-400 mb-2 block">Supabase Anon Key</label>
                 <input 
                   type="password"
                   className="w-full bg-slate-700 border border-slate-600 rounded px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-slate-400"
@@ -216,6 +375,35 @@ export default function App() {
                   onChange={(e) => setConfig({...config, key: e.target.value})}
                   placeholder="eyJhbG..."
                   required
+                />
+              </div>
+              <div>
+                <label className="text-xs font-semibold uppercase text-slate-400 mb-2 block">🤖 Gemini API Key (Optional)</label>
+                <input 
+                  type="password"
+                  className="w-full bg-slate-700 border border-slate-600 rounded px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-slate-400"
+                  value={config.geminiKey}
+                  onChange={(e) => setConfig({...config, geminiKey: e.target.value})}
+                  placeholder="Get from Google AI Studio - https://aistudio.google.com/"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-semibold uppercase text-slate-400 mb-2 block">🌤️ OpenWeather API Key (Optional)</label>
+                <input 
+                  type="password"
+                  className="w-full bg-slate-700 border border-slate-600 rounded px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-slate-400"
+                  value={config.weatherApiKey}
+                  onChange={(e) => setConfig({...config, weatherApiKey: e.target.value})}
+                  placeholder="Get from https://openweathermap.org/api"
+                />
+              </div>
+              <div className="md:col-span-2">
+                <label className="text-xs font-semibold uppercase text-slate-400 mb-2 block">🦙 Ollama Endpoint (Optional - Fallback AI)</label>
+                <input 
+                  className="w-full bg-slate-700 border border-slate-600 rounded px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-slate-400"
+                  value={config.ollamaEndpoint}
+                  onChange={(e) => setConfig({...config, ollamaEndpoint: e.target.value})}
+                  placeholder="http://localhost:11434 (Local Ollama server)"
                 />
               </div>
               <button 
@@ -227,6 +415,26 @@ export default function App() {
             </motion.div>
           )}
         </AnimatePresence>
+
+        {/* Analytics Dashboard */}
+        <div className="mb-6">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <TrendingUp size={18} className="text-blue-400" />
+              <h2 className="text-lg font-bold text-slate-100">Advanced Analytics</h2>
+            </div>
+            {isLoadingAllData && (
+              <span className="text-xs text-slate-400 animate-pulse">Loading historical data...</span>
+            )}
+          </div>
+          <Analytics 
+            nodes={nodes}
+            nodeHistory={nodeHistory}
+            geminiApiKey={config.geminiKey}
+            weatherApiKey={config.weatherApiKey}
+            ollamaEndpoint={config.ollamaEndpoint}
+          />
+        </div>
 
         {/* Nodes Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
@@ -273,6 +481,14 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* Previous Records Modal */}
+      <PreviousRecords 
+        isOpen={isRecordsOpen}
+        onClose={() => setIsRecordsOpen(false)}
+        allHistoricalData={allHistoricalData}
+        nodes={nodes}
+      />
     </div>
   );
 }
@@ -352,7 +568,6 @@ function NodeCard({ nodeName, data, history, activeTab, onTabChange }) {
   }, [history, activeTab, nodeName]);
 
   const isOnline = data.online !== false; // Default to true if not specified
-  const powerStatus = data.power_status || 'OFF';
   const ledStatus = data.led_status ? 'ON' : 'OFF';
   const statusDot = isOnline ? 'bg-emerald-500' : 'bg-red-500';
 
@@ -362,11 +577,6 @@ function NodeCard({ nodeName, data, history, activeTab, onTabChange }) {
       <div className="flex items-center justify-between p-3 border-b border-slate-700">
         <span className="font-mono text-sm font-semibold text-slate-100">{nodeName}</span>
         <div className="flex items-center gap-2">
-          <span className={`text-xs px-2 py-1 rounded-full font-mono ${
-            powerStatus === 'ON' ? 'bg-emerald-900/30 text-emerald-300' : 'bg-slate-700 text-slate-400'
-          }`}>
-            {powerStatus === 'ON' ? '● PWR ON' : '○ PWR OFF'}
-          </span>
           <span className={`text-xs px-2 py-1 rounded-full font-mono ${
             ledStatus === 'ON' ? 'bg-yellow-900/30 text-yellow-300' : 'bg-slate-700 text-slate-400'
           }`}>
@@ -419,5 +629,13 @@ function NodeCard({ nodeName, data, history, activeTab, onTabChange }) {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function AppWithErrorBoundary() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   );
 }
